@@ -9,8 +9,12 @@ requests==2.34.2
 Pillow==12.3.0
 python-dotenv==1.1.1
 
-# Optional — enable real YOLO / HF depth / plot click events
-# ultralytics
+# Vision — YOLO detect + MiDaS depth (torch comes with ultralytics)
+ultralytics>=8.3.0
+opencv-python-headless>=4.8.0
+timm>=1.0.0
+onnxruntime>=1.17.0
+
+# Optional — exact Depth Anything weights / plot click events
 # transformers
-# torch
 # streamlit-plotly-events

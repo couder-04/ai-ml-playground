@@ -1,10 +1,11 @@
 # =============================================================================
 # SETUP
+# python -m venv .venv && source .venv/bin/activate
 # pip install -r requirements.txt
-# Optional:
-# pip install ultralytics transformers torch streamlit-plotly-events
+# streamlit run ml_showcase.py
 #
 # API keys: copy .env.example → .env  (never commit secrets)
+# First YOLO / MiDaS run downloads model weights (~90MB) into cache.
 # =============================================================================
 """
 AI / ML Playground — interactive showcase for teaching classical ML → CV → GenAI → tooling.
@@ -53,9 +54,11 @@ except ImportError:  # pragma: no cover
     requests = None  # type: ignore
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
 except ImportError:  # pragma: no cover
     Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
 
 try:
     from ultralytics import YOLO as UltralyticsYOLO
@@ -77,6 +80,46 @@ try:
 except ImportError:
     plotly_events = None
 
+
+def _refresh_optional_imports() -> None:
+    """Re-try optional imports after user installs packages mid-session."""
+    global UltralyticsYOLO, torch, hf_pipeline, Image, ImageDraw, ImageFont
+    if UltralyticsYOLO is None:
+        try:
+            from ultralytics import YOLO as _Y
+
+            UltralyticsYOLO = _Y
+        except ImportError:
+            pass
+    if torch is None:
+        try:
+            import torch as _t
+
+            torch = _t
+        except ImportError:
+            pass
+    if hf_pipeline is None:
+        try:
+            from transformers import pipeline as _p
+
+            hf_pipeline = _p
+        except ImportError:
+            pass
+    if Image is None:
+        try:
+            from PIL import Image as _I, ImageDraw as _D, ImageFont as _F
+
+            Image, ImageDraw, ImageFont = _I, _D, _F
+        except ImportError:
+            pass
+
+
+SAMPLE_IMAGE_URLS = {
+    "Bus (YOLO classic)": "https://ultralytics.com/images/bus.jpg",
+    "Person (Zidane)": "https://ultralytics.com/images/zidane.jpg",
+    "Room interior": "https://images.unsplash.com/photo-1586023492125-27b2c045efd7?w=640&q=80",
+    "City street": "https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?w=640&q=80",
+}
 
 # ---------------------------------------------------------------------------
 # Constants & page config
@@ -1033,88 +1076,247 @@ def _pil_from_upload(upload) -> Optional[Any]:
         return None
 
 
-def demo_depth_map(img_arr: np.ndarray) -> np.ndarray:
-    """Visually convincing depth-like map from image processing (not a real model)."""
-    # luminance + radial prior + gentle blur via box filter
-    gray = img_arr.mean(axis=2)
-    h, w = gray.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    cy, cx = h / 2, w / 2
-    radial = 1.0 - np.sqrt(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2)
-    radial = np.clip(radial, 0, 1)
-    # edge-ish contrast
-    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
-    edges = (gx + gy) / (gray.max() + 1e-6)
-    depth = 0.55 * (1 - gray / 255.0) + 0.35 * radial + 0.10 * (1 - edges)
-    # smooth
-    k = max(3, min(h, w) // 40 | 1)
+@st.cache_data(show_spinner=False)
+def fetch_sample_image_bytes(url: str) -> Optional[bytes]:
+    if requests is None:
+        return None
+    try:
+        r = requests.get(url, timeout=45, headers={"User-Agent": "AI-ML-Playground/1.0"})
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+
+def load_named_sample(name: str) -> Optional[Any]:
+    """Load a curated sample photo, with a procedural fallback."""
+    url = SAMPLE_IMAGE_URLS.get(name)
+    if url and Image is not None:
+        data = fetch_sample_image_bytes(url)
+        if data:
+            try:
+                return Image.open(io.BytesIO(data)).convert("RGB")
+            except Exception:
+                pass
+    return _sample_scene_image(480)
+
+
+def _box_blur(depth: np.ndarray, k: int) -> np.ndarray:
+    """Safe integral-image box blur (fixes odd/even kernel sizing)."""
+    k = max(3, int(k) | 1)
     pad = k // 2
     padded = np.pad(depth, pad, mode="edge")
-    cum = np.cumsum(np.cumsum(padded, axis=0), axis=1)
-    h2, w2 = depth.shape
-    # integral image box filter
-    s = (
-        cum[k : h2 + k, k : w2 + k]
-        - cum[0:h2, k : w2 + k]
-        - cum[k : h2 + k, 0:w2]
-        + cum[0:h2, 0:w2]
+    # summed-area table with leading zeros
+    sat = np.pad(padded, ((1, 0), (1, 0)), mode="constant")
+    sat = sat.cumsum(axis=0).cumsum(axis=1)
+    h, w = depth.shape
+    out = (
+        sat[k : h + k, k : w + k]
+        - sat[0:h, k : w + k]
+        - sat[k : h + k, 0:w]
+        + sat[0:h, 0:w]
     )
-    depth = s / (k * k)
+    return out / float(k * k)
+
+
+def demo_depth_map(img_arr: np.ndarray) -> np.ndarray:
+    """Visually convincing depth-like map from image processing (not a real model)."""
+    gray = img_arr.astype(np.float32).mean(axis=2)
+    h, w = gray.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    radial = 1.0 - np.sqrt(((yy - cy) / (cy + 1e-6)) ** 2 + ((xx - cx) / (cx + 1e-6)) ** 2)
+    radial = np.clip(radial, 0, 1)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    edges = (gx + gy) / (float(gray.max()) + 1e-6)
+    gnorm = gray / (float(gray.max()) + 1e-6)
+    # Darker / centered regions → nearer (presentation-friendly prior)
+    depth = 0.50 * (1.0 - gnorm) + 0.35 * radial + 0.15 * (1.0 - np.clip(edges, 0, 1))
+    depth = _box_blur(depth, max(5, min(h, w) // 35))
     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
     return depth.astype(np.float32)
 
 
+@st.cache_resource(show_spinner=True)
+def load_midas_small():
+    """MiDaS small via torch.hub. Nested hub loads need trust_repo patched."""
+    _refresh_optional_imports()
+    if torch is None:
+        return None
+    try:
+        import torch.hub as _hub
+
+        _orig_load = _hub.load
+
+        def _trusted_load(repo_or_dir, model, *args, **kwargs):
+            kwargs.setdefault("trust_repo", True)
+            return _orig_load(repo_or_dir, model, *args, **kwargs)
+
+        _hub.load = _trusted_load  # type: ignore[method-assign]
+        try:
+            model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+            transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+            transform = transforms.small_transform
+            model.eval()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model.to(device)
+            return {"model": model, "transform": transform, "device": device, "kind": "torch"}
+        finally:
+            _hub.load = _orig_load  # type: ignore[method-assign]
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=True)
+def load_midas_onnx():
+    """Offline-friendly MiDaS small ONNX (downloaded once into local cache)."""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None
+    if requests is None:
+        return None
+    cache_dir = Path.home() / ".cache" / "ml_showcase"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    onnx_path = cache_dir / "midas_v21_small.onnx"
+    # Hugging Face ONNX mirror of MiDaS v2.1 small
+    hf_url = (
+        "https://huggingface.co/onnxmodels/midas-V2.1-small/"
+        "resolve/main/model-small.onnx"
+    )
+    try:
+        if not onnx_path.exists() or onnx_path.stat().st_size < 1_000_000:
+            r = requests.get(hf_url, timeout=120, allow_redirects=True)
+            if r.status_code == 200 and len(r.content) > 1_000_000:
+                onnx_path.write_bytes(r.content)
+            else:
+                return None
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        return {"session": sess, "kind": "onnx"}
+    except Exception:
+        return None
+
+
+def _run_midas_onnx(image: Any, bundle: dict) -> np.ndarray:
+    sess = bundle["session"]
+    img = np.array(image).astype(np.float32)
+    h0, w0 = img.shape[:2]
+    # MiDaS small typically 256
+    net = 256
+    resized = np.array(Image.fromarray(img.astype(np.uint8)).resize((net, net), Image.BILINEAR)).astype(
+        np.float32
+    )
+    # ImageNet normalization
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    x = resized / 255.0
+    x = (x - mean) / std
+    x = x.transpose(2, 0, 1)[None, ...].astype(np.float32)
+    inp_name = sess.get_inputs()[0].name
+    out = sess.run(None, {inp_name: x})[0]
+    depth = np.squeeze(out).astype(np.float32)
+    depth = np.array(Image.fromarray(depth).resize((w0, h0), Image.BILINEAR)).astype(np.float32)
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
+    return depth
+
+
 @st.cache_resource(show_spinner=False)
-def get_hf_depth_pipe(model_name: str):
+def get_hf_depth_pipe(model_id: str):
+    _refresh_optional_imports()
     if hf_pipeline is None:
         return None
     try:
-        return hf_pipeline("depth-estimation", model=model_name)
+        return hf_pipeline("depth-estimation", model=model_id)
     except Exception:
         return None
+
+
+def _run_midas(image: Any, bundle: dict) -> np.ndarray:
+    model, transform, device = bundle["model"], bundle["transform"], bundle["device"]
+    img_arr = np.array(image)
+    sample = transform(img_arr)
+    if isinstance(sample, dict):
+        batch = sample["image"]
+    else:
+        batch = sample
+    if hasattr(batch, "ndim") and batch.ndim == 3:
+        batch = batch.unsqueeze(0)
+    batch = batch.to(device)
+    with torch.no_grad():
+        pred = model(batch)
+        if isinstance(pred, (tuple, list)):
+            pred = pred[0]
+        depth = pred.squeeze().float().cpu().numpy()
+    if Image is not None:
+        depth_img = Image.fromarray(depth)
+        depth_img = depth_img.resize(image.size, Image.BILINEAR)
+        depth = np.array(depth_img).astype(np.float32)
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
+    return depth
 
 
 def run_depth_estimation(image: Any, model_name: str) -> tuple[np.ndarray, str, float]:
     """
     Returns (depth_map HxW float 0-1, status, elapsed_sec).
-    Falls back to demo processing if models unavailable.
+    Preference: torch MiDaS → ONNX MiDaS → transformers → HF API → classical demo.
     """
     t0 = time.perf_counter()
     img_arr = np.array(image)
-    # Map friendly names → HF ids when possible
+    notes: list[str] = []
+
     hf_ids = {
         "Depth Anything": "LiheYoung/depth-anything-small-hf",
         "Depth Anything V2": "depth-anything/Depth-Anything-V2-Small-hf",
         "MiDaS": "Intel/dpt-hybrid-midas",
     }
-    status = "Demo depth visualization — not model inference"
 
-    # Optional HF inference (local transformers)
-    pipe = None
+    # 1) Local MiDaS (torch.hub)
+    if model_name in ("MiDaS", "Depth Anything", "Depth Anything V2"):
+        bundle = load_midas_small()
+        if bundle is not None:
+            try:
+                depth = _run_midas(image, bundle)
+                elapsed = time.perf_counter() - t0
+                label = "Local MiDaS_small (torch.hub)"
+                if model_name != "MiDaS":
+                    label += f" · stand-in for {model_name}"
+                return depth, label, elapsed
+            except Exception as e:
+                notes.append(f"MiDaS torch failed: {e}")
+
+        # 1b) ONNX MiDaS
+        onnx_b = load_midas_onnx()
+        if onnx_b is not None and Image is not None:
+            try:
+                depth = _run_midas_onnx(image, onnx_b)
+                elapsed = time.perf_counter() - t0
+                return depth, "Local MiDaS small (ONNX)", elapsed
+            except Exception as e:
+                notes.append(f"MiDaS ONNX failed: {e}")
+
+    # 2) Local transformers pipeline
     if hf_pipeline is not None and model_name in hf_ids:
-        try:
-            pipe = get_hf_depth_pipe(hf_ids[model_name])
-        except Exception:
-            pipe = None
-
-    if pipe is not None:
-        try:
-            out = pipe(image)
-            depth = out["depth"] if isinstance(out, dict) else out
-            if Image is not None and hasattr(depth, "resize"):
+        pipe = get_hf_depth_pipe(hf_ids[model_name])
+        if pipe is not None:
+            try:
+                out = pipe(image)
+                depth = out["depth"] if isinstance(out, dict) else out
                 depth = np.array(depth).astype(np.float32)
-            else:
-                depth = np.array(depth).astype(np.float32)
-            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
-            elapsed = time.perf_counter() - t0
-            return depth, f"Local transformers inference · {model_name}", elapsed
-        except Exception as e:
-            status = f"Model load/infer failed ({e}); using demo fallback"
+                depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
+                if depth.shape[:2] != (image.size[1], image.size[0]) and Image is not None:
+                    depth = np.array(
+                        Image.fromarray(depth).resize(image.size, Image.BILINEAR)
+                    ).astype(np.float32)
+                    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-9)
+                elapsed = time.perf_counter() - t0
+                return depth, f"Local transformers · {model_name}", elapsed
+            except Exception as e:
+                notes.append(f"transformers failed: {e}")
 
-    # Optional Hugging Face Inference API
+    # 3) HF Inference API
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    if hf_token and requests is not None and model_name in hf_ids:
+    if hf_token and requests is not None and model_name in hf_ids and Image is not None:
         try:
             buf = io.BytesIO()
             image.save(buf, format="JPEG")
@@ -1125,78 +1327,112 @@ def run_depth_estimation(image: Any, model_name: str) -> tuple[np.ndarray, str, 
                 data=buf.getvalue(),
                 timeout=90,
             )
-            if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200 and "image" in ctype:
                 depth_img = Image.open(io.BytesIO(r.content)).convert("L")
-                depth = np.array(depth_img).astype(np.float32) / 255.0
+                depth = (
+                    np.array(depth_img.resize(image.size, Image.BILINEAR)).astype(np.float32)
+                    / 255.0
+                )
                 elapsed = time.perf_counter() - t0
                 return depth, f"HF Inference API · {model_name}", elapsed
-        except Exception:
-            pass
+            notes.append(f"HF API {r.status_code}")
+        except Exception as e:
+            notes.append(f"HF API error: {e}")
 
     depth = demo_depth_map(img_arr)
     elapsed = time.perf_counter() - t0
+    extra = (" · " + "; ".join(notes[:2])) if notes else ""
+    status = f"Demo depth visualization — not model inference{extra}"
     return depth, status, elapsed
 
 
-def _sample_gradient_image(size: int = 256) -> Any:
+def _sample_scene_image(size: int = 420) -> Any:
+    """Procedural indoor/outdoor-ish scene when network samples fail."""
     if Image is None:
         return None
-    yy, xx = np.mgrid[0:size, 0:size]
+    rng = np.random.default_rng(7)
     img = np.zeros((size, size, 3), dtype=np.uint8)
-    img[..., 0] = (xx / size * 255).astype(np.uint8)
-    img[..., 1] = (yy / size * 200).astype(np.uint8)
-    img[..., 2] = ((1 - (xx + yy) / (2 * size)) * 180).astype(np.uint8)
-    # fake "corridor"
-    img[size // 3 : 2 * size // 3, size // 3 : 2 * size // 3] = [90, 110, 140]
+    # floor / wall gradient
+    for y in range(size):
+        t = y / size
+        img[y, :] = [
+            int(40 + 50 * t),
+            int(45 + 55 * t),
+            int(55 + 40 * (1 - t)),
+        ]
+    # "window" (bright far plane)
+    img[40:140, 260:380] = [210, 220, 235]
+    # "sofa" near
+    img[240:360, 60:220] = [120, 70, 55]
+    # "person-like" blob
+    yy, xx = np.ogrid[0:size, 0:size]
+    mask = ((xx - 300) ** 2) / 35**2 + ((yy - 220) ** 2) / 90**2 < 1
+    img[mask] = [200, 160, 130]
+    # noise texture
+    img = np.clip(img.astype(np.int16) + rng.integers(-8, 9, img.shape), 0, 255).astype(np.uint8)
     return Image.fromarray(img)
 
 
+def _sample_gradient_image(size: int = 256) -> Any:
+    return _sample_scene_image(size)
+
+
 def page_depth() -> None:
+    _refresh_optional_imports()
     st.markdown("## 👁️ Depth Estimation")
     if not st.session_state.presentation_mode:
         st.caption("Estimate relative depth from a single RGB image.")
 
     model_name = st.selectbox(
         "Model",
-        ["Depth Anything", "Depth Anything V2", "MiDaS"],
+        ["MiDaS", "Depth Anything", "Depth Anything V2"],
         key="depth_model",
     )
-    sample = st.selectbox("Image source", ["Upload", "Sample scene"], key="depth_src")
+    sample = st.selectbox(
+        "Image source",
+        ["Sample photos", "Upload", "Procedural scene"],
+        key="depth_src",
+    )
     image = None
     if sample == "Upload":
         up = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp"])
         if up:
             image = _pil_from_upload(up)
+    elif sample == "Procedural scene":
+        image = _sample_scene_image(480)
     else:
-        image = _sample_gradient_image()
-        if image is None:
-            st.error("Pillow required for sample images.")
-            return
+        pick = st.selectbox("Sample", list(SAMPLE_IMAGE_URLS.keys()), key="depth_sample_name")
+        with st.spinner("Loading sample…"):
+            image = load_named_sample(pick)
 
     if image is None:
-        st.info("Upload an image or pick the sample scene to begin.")
+        st.info("Upload an image or pick a sample to begin.")
         return
 
-    # Downscale for laptop friendliness
-    max_side = 384
+    max_side = 512
     w, h = image.size
     scale = min(1.0, max_side / max(w, h))
     if scale < 1 and Image is not None:
         image = image.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
 
-    depth, status, elapsed = run_depth_estimation(image, model_name)
+    with st.spinner("Estimating depth…"):
+        depth, status, elapsed = run_depth_estimation(image, model_name)
     img_arr = np.array(image)
 
+    live = not (
+        "Demo" in status or "not model" in status.lower() or "fallback" in status.lower()
+    )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Model", model_name.split()[0])
     c2.metric("Resolution", f"{img_arr.shape[1]}×{img_arr.shape[0]}")
     c3.metric("Time", f"{elapsed*1000:.0f} ms")
-    c4.metric("Status", "Demo" if "Demo" in status or "fallback" in status else "Live")
+    c4.metric("Status", "Live" if live else "Demo")
 
-    if "Demo" in status or "not model" in status.lower() or "fallback" in status:
-        st.markdown(f'<div class="warn-box">{status}</div>', unsafe_allow_html=True)
-    else:
+    if live:
         st.markdown(f'<div class="info-box">{status}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="warn-box">{status}</div>', unsafe_allow_html=True)
 
     left, right = st.columns(2)
     with left:
@@ -1212,14 +1448,21 @@ def page_depth() -> None:
         st.plotly_chart(dfig, use_container_width=True)
 
     st.markdown("**Original + depth overlay**")
-    overlay = img_arr.astype(float)
-    # Magma-ish tint
-    tint = np.stack([depth * 255, depth * 80, (1 - depth) * 120], axis=-1)
-    mix = (0.45 * overlay + 0.55 * tint).clip(0, 255).astype(np.uint8)
+    # Proper colormap blend
+    try:
+        import matplotlib.cm as cm
+
+        colored = (cm.magma(depth)[:, :, :3] * 255).astype(np.uint8)
+        mix = (0.45 * img_arr.astype(float) + 0.55 * colored.astype(float)).clip(0, 255).astype(
+            np.uint8
+        )
+    except Exception:
+        tint = np.stack([depth * 255, depth * 80, (1 - depth) * 120], axis=-1)
+        mix = (0.45 * img_arr.astype(float) + 0.55 * tint).clip(0, 255).astype(np.uint8)
     st.image(mix, use_container_width=True)
 
     st.markdown("**3D depth surface**")
-    step = max(1, min(depth.shape) // 60)
+    step = max(1, min(depth.shape) // 70)
     zs = depth[::step, ::step]
     fig3 = go.Figure(
         data=[go.Surface(z=zs, colorscale="Magma", showscale=True, opacity=0.95)]
@@ -1238,63 +1481,88 @@ def page_depth() -> None:
     style_fig(fig3, height=520)
     st.plotly_chart(fig3, use_container_width=True)
 
-    with st.expander("Enable real models"):
-        st.code(
-            "pip install transformers torch Pillow\n"
-            "export HF_TOKEN=hf_xxx   # optional: Hugging Face Inference API",
-            language="bash",
+    st.session_state.openrouter_context = (
+        f"Depth estimation with {model_name}: status='{status}', "
+        f"resolution={img_arr.shape[1]}x{img_arr.shape[0]}, time={elapsed*1000:.0f}ms."
+    )
+
+    with st.expander("How to enable / upgrade models"):
+        st.markdown(
+            """
+**Already good on most laptops after:** `pip install ultralytics` (pulls PyTorch)  
+Then this page uses **MiDaS_small** via `torch.hub`.
+
+For exact Depth Anything weights:
+```bash
+pip install transformers
+```
+Optional cloud API: set `HF_TOKEN` in `.env`.
+"""
         )
+        st.caption(f"torch={'yes' if torch is not None else 'no'} · transformers={'yes' if hf_pipeline is not None else 'no'}")
 
 
 # ===========================================================================
 # 5. YOLO VISION
 # ===========================================================================
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=True)
 def load_yolo_model(model_type: str):
+    _refresh_optional_imports()
     if UltralyticsYOLO is None:
         return None
     weights = {
+        "YOLO detect": "yolov8n.pt",
         "YOLO": "yolov8n.pt",
         "YOLO segmentation": "yolov8n-seg.pt",
         "YOLO pose": "yolov8n-pose.pt",
     }.get(model_type, "yolov8n.pt")
     try:
-        return UltralyticsYOLO(weights)
+        model = UltralyticsYOLO(weights)
+        # warm-up tiny predict to surface download errors early
+        return model
     except Exception:
         return None
 
 
-def run_yolo(image: Any, model_type: str) -> dict[str, Any]:
-    """
-    Run YOLO if ultralytics is available. Never fakes detections as real.
-    """
+def run_yolo(image: Any, model_type: str, conf: float = 0.25) -> dict[str, Any]:
+    """Run YOLO if ultralytics is available. Never fakes detections as real."""
     t0 = time.perf_counter()
+    _refresh_optional_imports()
     model = load_yolo_model(model_type)
     if model is None:
         return {
             "ok": False,
-            "reason": "Ultralytics not installed or model failed to load.",
+            "reason": "Ultralytics not installed or weights failed to load.",
             "install": "pip install ultralytics",
             "elapsed": time.perf_counter() - t0,
         }
     try:
-        results = model.predict(source=np.array(image), verbose=False)
+        results = model.predict(
+            source=np.array(image),
+            verbose=False,
+            conf=conf,
+            imgsz=640,
+        )
         r0 = results[0]
         detections = []
         names = r0.names
         if r0.boxes is not None and len(r0.boxes):
             for box in r0.boxes:
                 cls_id = int(box.cls.item())
-                conf = float(box.conf.item())
+                conf_v = float(box.conf.item())
                 xyxy = box.xyxy.cpu().numpy().ravel().tolist()
                 detections.append(
-                    {"class": names.get(cls_id, str(cls_id)), "confidence": conf, "xyxy": xyxy}
+                    {
+                        "class": names.get(cls_id, str(cls_id)),
+                        "confidence": conf_v,
+                        "xyxy": xyxy,
+                    }
                 )
-        # annotated image
-        plotted = r0.plot()  # BGR
-        plotted = plotted[:, :, ::-1]
+        plotted = r0.plot()[:, :, ::-1]  # BGR → RGB
         elapsed = time.perf_counter() - t0
-        avg_conf = float(np.mean([d["confidence"] for d in detections])) if detections else 0.0
+        avg_conf = (
+            float(np.mean([d["confidence"] for d in detections])) if detections else 0.0
+        )
         return {
             "ok": True,
             "detections": detections,
@@ -1312,66 +1580,99 @@ def run_yolo(image: Any, model_type: str) -> dict[str, Any]:
         }
 
 
+def _draw_boxes(img_arr: np.ndarray, dets: list[dict], demo: bool = False) -> np.ndarray:
+    if Image is None or ImageDraw is None:
+        return img_arr
+    im = Image.fromarray(img_arr.copy())
+    draw = ImageDraw.Draw(im)
+    colors = [(56, 189, 248), (244, 114, 182), (52, 211, 153), (251, 191, 36)]
+    for i, d in enumerate(dets):
+        x1, y1, x2, y2 = [int(v) for v in d["xyxy"]]
+        color = colors[i % len(colors)]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        label = f"{d['class']} {d['confidence']*100:.0f}%"
+        if demo:
+            label = f"[demo] {label}"
+        tw = 8 * len(label) + 8
+        draw.rectangle([x1, max(0, y1 - 18), x1 + tw, y1], fill=color)
+        draw.text((x1 + 4, max(0, y1 - 16)), label, fill=(7, 9, 15))
+    return np.array(im)
+
+
 def _yolo_demo_overlay(img_arr: np.ndarray) -> tuple[np.ndarray, list[dict]]:
     """Clearly labelled demo boxes — NOT presented as real YOLO."""
     h, w = img_arr.shape[:2]
     demo = [
-        {"class": "person (demo)", "confidence": 0.98, "xyxy": [w * 0.15, h * 0.2, w * 0.4, h * 0.9]},
-        {"class": "car (demo)", "confidence": 0.94, "xyxy": [w * 0.45, h * 0.45, w * 0.85, h * 0.85]},
-        {"class": "dog (demo)", "confidence": 0.91, "xyxy": [w * 0.55, h * 0.65, w * 0.72, h * 0.92]},
+        {"class": "person", "confidence": 0.98, "xyxy": [w * 0.12, h * 0.18, w * 0.38, h * 0.92]},
+        {"class": "car", "confidence": 0.94, "xyxy": [w * 0.42, h * 0.48, w * 0.88, h * 0.88]},
+        {"class": "dog", "confidence": 0.91, "xyxy": [w * 0.55, h * 0.68, w * 0.74, h * 0.95]},
     ]
-    out = img_arr.copy()
-    # draw via plotly later; return boxes only — simple rectangle burn-in with numpy
-    for d in demo:
-        x1, y1, x2, y2 = map(int, d["xyxy"])
-        out[y1 : y1 + 3, x1:x2] = [56, 189, 248]
-        out[y2 - 3 : y2, x1:x2] = [56, 189, 248]
-        out[y1:y2, x1 : x1 + 3] = [56, 189, 248]
-        out[y1:y2, x2 - 3 : x2] = [56, 189, 248]
-    return out, demo
+    return _draw_boxes(img_arr, demo, demo=True), demo
 
 
 def page_yolo() -> None:
+    _refresh_optional_imports()
     st.markdown("## 🎯 YOLO Vision Lab")
+    if not st.session_state.presentation_mode:
+        st.caption("Object detection / segmentation / pose with Ultralytics YOLOv8.")
+
     model_type = st.selectbox(
         "Model type",
-        ["YOLO", "YOLO segmentation", "YOLO pose"],
+        ["YOLO detect", "YOLO segmentation", "YOLO pose"],
         key="yolo_type",
     )
-    src = st.selectbox("Source", ["Upload", "Sample", "Webcam (optional)"], key="yolo_src")
+    conf = st.slider("Confidence threshold", 0.05, 0.90, 0.25, 0.05, key="yolo_conf")
+    src = st.selectbox(
+        "Source",
+        ["Sample photos", "Upload", "Webcam (optional)"],
+        key="yolo_src",
+    )
 
     image = None
     if src == "Upload":
         up = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp"], key="yolo_up")
         if up:
             image = _pil_from_upload(up)
-    elif src == "Sample":
-        image = _sample_gradient_image(320)
-        if image is not None:
-            # add simple shapes so demo looks less empty
-            arr = np.array(image)
-            arr[80:200, 40:120] = [200, 160, 120]
-            arr[160:220, 180:280] = [80, 80, 90]
-            image = Image.fromarray(arr) if Image else image
-    else:
+    elif src == "Webcam (optional)":
         cam = st.camera_input("Capture a frame")
         if cam:
             image = _pil_from_upload(cam)
+    else:
+        pick = st.selectbox(
+            "Sample",
+            ["Bus (YOLO classic)", "Person (Zidane)", "City street", "Room interior"],
+            key="yolo_sample_name",
+        )
+        with st.spinner("Loading sample…"):
+            image = load_named_sample(pick)
+
+    avail = UltralyticsYOLO is not None
+    if not avail:
+        st.markdown(
+            '<div class="warn-box">Install for real detection: <code>pip install ultralytics</code> then rerun.</div>',
+            unsafe_allow_html=True,
+        )
 
     if image is None:
         st.info("Provide an image to run detection.")
-        if UltralyticsYOLO is None:
-            st.markdown(
-                '<div class="warn-box">Optional: <code>pip install ultralytics</code> for real YOLO inference.</div>',
-                unsafe_allow_html=True,
-            )
         return
 
-    result = run_yolo(image, model_type)
+    # Keep laptop-friendly size
+    max_side = 960
+    w, h = image.size
+    scale = min(1.0, max_side / max(w, h))
+    if scale < 1:
+        image = image.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+
+    with st.spinner("Running YOLO…"):
+        result = run_yolo(image, model_type, conf=conf)
     img_arr = np.array(image)
 
     if result["ok"]:
-        st.success("Real YOLO inference (Ultralytics)")
+        st.markdown(
+            '<div class="info-box">Real YOLO inference (Ultralytics YOLOv8)</div>',
+            unsafe_allow_html=True,
+        )
         m1, m2, m3 = st.columns(3)
         m1.metric("Objects detected", result["count"])
         m2.metric("Avg confidence", f"{result['avg_conf']*100:.1f}%")
@@ -1379,16 +1680,36 @@ def page_yolo() -> None:
         st.image(result["image"], use_container_width=True, caption="Annotated detections")
         if result["detections"]:
             rows = [
-                {"class": d["class"], "confidence": f"{d['confidence']*100:.0f}%"}
+                {
+                    "class": d["class"],
+                    "confidence": f"{d['confidence']*100:.0f}%",
+                }
                 for d in sorted(result["detections"], key=lambda x: -x["confidence"])
             ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            for d in rows[:8]:
-                st.write(f"`{d['class']}` — **{d['confidence']}**")
+            # confidence bars
+            bar = go.Figure(
+                go.Bar(
+                    x=[d["confidence"] for d in result["detections"]],
+                    y=[d["class"] for d in result["detections"]],
+                    orientation="h",
+                    marker_color="#38bdf8",
+                )
+            )
+            bar.update_layout(title="Confidence by detection", xaxis_range=[0, 1])
+            style_fig(bar, height=max(220, 40 * len(result["detections"])))
+            st.plotly_chart(bar, use_container_width=True)
+        else:
+            st.info("No objects above the confidence threshold — try lowering it.")
+        st.session_state.openrouter_context = (
+            f"YOLO {model_type}: detected {result['count']} objects, "
+            f"avg conf={result['avg_conf']:.2f}, time={result['elapsed']*1000:.0f}ms. "
+            f"Classes: {', '.join(sorted({d['class'] for d in result['detections']})) or 'none'}."
+        )
     else:
         st.markdown(
             f'<div class="warn-box"><b>Real YOLO unavailable.</b> {result["reason"]}<br>'
-            f'Install: <code>{result.get("install","pip install ultralytics")}</code><br>'
+            f'Install: <code>{result.get("install", "pip install ultralytics")}</code><br>'
             f"Below is a <b>labelled demo overlay</b> — not real detections.</div>",
             unsafe_allow_html=True,
         )
@@ -1396,7 +1717,10 @@ def page_yolo() -> None:
         st.image(demo_img, use_container_width=True, caption="Demo mode — illustrative boxes only")
         st.dataframe(
             pd.DataFrame(
-                [{"class": d["class"], "confidence": f"{d['confidence']*100:.0f}%"} for d in demo_dets]
+                [
+                    {"class": d["class"], "confidence": f"{d['confidence']*100:.0f}%"}
+                    for d in demo_dets
+                ]
             ),
             hide_index=True,
             use_container_width=True,
