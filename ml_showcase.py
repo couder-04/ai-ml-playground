@@ -1,8 +1,10 @@
 # =============================================================================
 # SETUP
-# pip install streamlit numpy pandas matplotlib scikit-learn plotly requests streamlit-plotly-events
+# pip install -r requirements.txt
 # Optional:
-# pip install ultralytics transformers torch Pillow
+# pip install ultralytics transformers torch streamlit-plotly-events
+#
+# API keys: copy .env.example → .env  (never commit secrets)
 # =============================================================================
 """
 AI / ML Playground — interactive showcase for teaching classical ML → CV → GenAI → tooling.
@@ -13,17 +15,17 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import time
 import traceback
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Generator, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 from sklearn.datasets import make_classification
 from sklearn.decomposition import PCA
@@ -35,6 +37,14 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+
+# Load .env early (local only; .env is gitignored)
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:
+    pass
 
 # Optional deps — never crash if missing
 try:
@@ -96,6 +106,25 @@ OPENROUTER_MODELS = [
     "google/gemini-2.0-flash-001",
     "meta-llama/llama-3.3-70b-instruct",
     "mistralai/mistral-small-24b-instruct-2501",
+    "deepseek/deepseek-chat",
+    "qwen/qwen-2.5-72b-instruct",
+]
+
+OPENROUTER_EMBED_MODELS = [
+    "openai/text-embedding-3-small",
+    "openai/text-embedding-3-large",
+    "qwen/qwen3-embedding-0.6b",
+    "perplexity/pplx-embed-v1-0.6b",
+]
+
+OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1"
+
+QUICK_PROMPTS = [
+    "Explain logistic regression like I’m a first-year CSE student.",
+    "What’s the difference between precision and recall?",
+    "Explain embeddings with a king/queen analogy.",
+    "Compare supervised vs reinforcement learning using Mario.",
+    "When should I use Colab vs Kaggle vs a local laptop?",
 ]
 
 st.set_page_config(
@@ -104,6 +133,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def get_openrouter_key() -> str:
+    """Resolve API key from env / .env / Streamlit secrets — never hardcode."""
+    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("OPENROUTER_API_KEY", "") or "").strip()
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +160,8 @@ def _init_state() -> None:
         "agent_step": 0,
         "openrouter_context": "",
         "gs_seed": 42,
+        "or_messages": [],
+        "or_pending_prompt": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -450,9 +492,15 @@ def page_home() -> None:
             )
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("▶ Start with Logistic Regression", type="primary"):
-        nav_to(1)
-        st.rerun()
+    cta1, cta2 = st.columns(2)
+    with cta1:
+        if st.button("▶ Start with Logistic Regression", type="primary", use_container_width=True):
+            nav_to(1)
+            st.rerun()
+    with cta2:
+        if st.button("🤖 Open OpenRouter chat", use_container_width=True):
+            nav_to(PAGES.index("🤖 OpenRouter AI"))
+            st.rerun()
 
 
 # ===========================================================================
@@ -696,6 +744,14 @@ Yellow **×** markers are misclassified points under the current threshold.
         f"accuracy={acc:.3f}, precision={prec:.3f}, recall={rec:.3f}, F1={f1:.3f}, "
         f"coef=[{coef[0,0]:.3f},{coef[0,1]:.3f}], intercept={intercept[0]:.3f}."
     )
+    if st.button("Ask OpenRouter to explain this demo", key="lr_ask_ai"):
+        st.session_state.or_pending_prompt = (
+            "Explain this live logistic-regression demo to a first-year CSE student:\n\n"
+            + st.session_state.openrouter_context
+            + "\n\nCover: probability vs class, threshold trade-offs, and what the coefficients mean."
+        )
+        nav_to(PAGES.index("🤖 OpenRouter AI"))
+        st.rerun()
 
 
 # ===========================================================================
@@ -755,7 +811,7 @@ class DemoEmbeddingProvider(EmbeddingProvider):
 
 
 class OpenAICompatEmbeddingProvider(EmbeddingProvider):
-    """Optional OpenAI-compatible embeddings endpoint (e.g. some providers)."""
+    """OpenAI-compatible embeddings (OpenRouter, OpenAI, etc.)."""
 
     name = "openai_compat"
 
@@ -763,21 +819,28 @@ class OpenAICompatEmbeddingProvider(EmbeddingProvider):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.name = model
 
     def embed(self, texts: list[str], dim: int = 64) -> np.ndarray:
         if requests is None:
             raise RuntimeError("requests package is required for API mode")
         url = f"{self.base_url}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        # OpenRouter asks for these attribution headers
+        if "openrouter.ai" in self.base_url:
+            headers["HTTP-Referer"] = "http://localhost:8501"
+            headers["X-Title"] = "AI ML Playground"
         resp = requests.post(
             url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json={"model": self.model, "input": texts},
             timeout=60,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise RuntimeError(f"{resp.status_code}: {resp.text[:400]}")
         data = resp.json()["data"]
         data = sorted(data, key=lambda d: d["index"])
         return np.array([d["embedding"] for d in data], dtype=float)
@@ -803,29 +866,62 @@ def page_embeddings() -> None:
         st.warning("Enter at least two words.")
         return
 
+    or_key = get_openrouter_key()
+    default_mode = "OpenRouter API" if or_key else "Demo Mode"
     mode = st.radio(
         "Embedding source",
-        ["Demo Mode", "API Mode"],
+        ["Demo Mode", "OpenRouter API", "Custom API"],
+        index=["Demo Mode", "OpenRouter API", "Custom API"].index(default_mode),
         horizontal=True,
         key="embed_mode_radio",
     )
-    dim = st.slider("Embedding dimension (demo)", 16, 128, 64, 8, key="embed_dim")
+    dim = st.slider("Embedding dimension (demo only)", 16, 128, 64, 8, key="embed_dim")
 
     provider: EmbeddingProvider
-    err = None
     if mode == "Demo Mode":
         provider = DemoEmbeddingProvider()
         st.markdown(
             '<div class="info-box">Demo Mode uses deterministic pseudo-embeddings so the viz always works offline.</div>',
             unsafe_allow_html=True,
         )
+    elif mode == "OpenRouter API":
+        embed_model = st.selectbox(
+            "OpenRouter embedding model",
+            OPENROUTER_EMBED_MODELS,
+            key="or_embed_model",
+        )
+        if not or_key:
+            st.markdown(
+                '<div class="warn-box">Set <code>OPENROUTER_API_KEY</code> in <code>.env</code> for live embeddings. Falling back to Demo.</div>',
+                unsafe_allow_html=True,
+            )
+            provider = DemoEmbeddingProvider()
+        else:
+            provider = OpenAICompatEmbeddingProvider(
+                or_key, OPENROUTER_EMBED_URL, embed_model
+            )
+            st.markdown(
+                f'<div class="info-box">Using OpenRouter embeddings · <code>{embed_model}</code></div>',
+                unsafe_allow_html=True,
+            )
     else:
-        api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-        base_url = st.text_input("Embeddings base URL", value=os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1"))
-        model = st.text_input("Embedding model", value=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"))
+        api_key = (
+            os.getenv("EMBEDDING_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or or_key
+            or ""
+        )
+        base_url = st.text_input(
+            "Embeddings base URL",
+            value=os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1"),
+        )
+        model = st.text_input(
+            "Embedding model",
+            value=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        )
         if not api_key:
             st.markdown(
-                '<div class="warn-box">Set <code>EMBEDDING_API_KEY</code> (or <code>OPENAI_API_KEY</code>) to use API Mode. Falling back to Demo.</div>',
+                '<div class="warn-box">Set an embedding API key. Falling back to Demo.</div>',
                 unsafe_allow_html=True,
             )
             provider = DemoEmbeddingProvider()
@@ -836,8 +932,7 @@ def page_embeddings() -> None:
         with st.spinner("Computing embeddings…"):
             emb = provider.embed(words, dim=dim)
     except Exception as e:
-        err = str(e)
-        st.error(f"API embedding failed — using Demo Mode. ({err})")
+        st.error(f"API embedding failed — using Demo Mode. ({e})")
         emb = DemoEmbeddingProvider().embed(words, dim=dim)
 
     # PCA
@@ -1505,10 +1600,14 @@ def openrouter_chat(
     model: str,
     temperature: float,
     max_tokens: int,
-) -> tuple[bool, str]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    stream: bool = False,
+) -> tuple[bool, Any]:
+    api_key = get_openrouter_key()
     if not api_key:
-        return False, "Missing OPENROUTER_API_KEY. Export it in your shell, then restart Streamlit."
+        return False, (
+            "Missing OPENROUTER_API_KEY. Add it to a local `.env` file "
+            "(see `.env.example`) or export it in your shell, then restart Streamlit."
+        )
     if requests is None:
         return False, "Install requests: pip install requests"
     try:
@@ -1525,67 +1624,175 @@ def openrouter_chat(
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "stream": stream,
             },
-            timeout=90,
+            timeout=120,
+            stream=stream,
         )
         if r.status_code != 200:
-            return False, f"API error {r.status_code}: {r.text[:500]}"
-        data = r.json()
-        return True, data["choices"][0]["message"]["content"]
+            body = r.text[:600] if not stream else ""
+            if stream:
+                try:
+                    body = r.json().get("error", {}).get("message", r.text[:600])
+                except Exception:
+                    body = r.text[:600]
+            return False, f"API error {r.status_code}: {body}"
+        if not stream:
+            data = r.json()
+            return True, data["choices"][0]["message"]["content"]
+        return True, r
     except Exception as e:
         return False, f"Request failed: {e}"
 
 
+def _stream_openrouter(response) -> Generator[str, None, None]:
+    """Yield text deltas from an OpenRouter SSE response."""
+    for line in response.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith("data: "):
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+                delta = chunk["choices"][0].get("delta", {})
+                piece = delta.get("content") or ""
+                if piece:
+                    yield piece
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                continue
+
+
 def page_openrouter() -> None:
     st.markdown("## 🤖 OpenRouter AI Playground")
-    key_present = bool(os.getenv("OPENROUTER_API_KEY"))
+    if not st.session_state.presentation_mode:
+        st.caption("One API key → many models. Great for demos without juggling vendor accounts.")
+
+    key_present = bool(get_openrouter_key())
     if not key_present:
         st.markdown(
-            '<div class="warn-box">No <code>OPENROUTER_API_KEY</code> found in environment. '
-            "You can still draft prompts; sending will show a clear error.</div>",
+            '<div class="warn-box">No <code>OPENROUTER_API_KEY</code> found. '
+            "Copy <code>.env.example</code> → <code>.env</code>, add your key, restart Streamlit.</div>",
             unsafe_allow_html=True,
         )
     else:
-        st.markdown('<div class="info-box">API key detected — ready to chat.</div>', unsafe_allow_html=True)
+        masked = get_openrouter_key()
+        tip = f"...{masked[-4:]}" if len(masked) > 8 else "set"
+        st.markdown(
+            f'<div class="info-box">OpenRouter connected <code>({tip})</code> — chat streams live.</div>',
+            unsafe_allow_html=True,
+        )
 
-    model = st.selectbox("Model", OPENROUTER_MODELS, key="or_model")
-    c1, c2 = st.columns(2)
-    temperature = c1.slider("Temperature", 0.0, 1.5, 0.7, 0.05, key="or_temp")
-    max_tokens = c2.slider("Max tokens", 64, 2048, 512, 64, key="or_tokens")
-    system_prompt = st.text_area(
-        "System prompt",
-        value="You are a clear, friendly ML teaching assistant for first-year CSE students.",
-        height=80,
-        key="or_sys",
-    )
+    with st.expander("Model & sampling", expanded=not st.session_state.presentation_mode):
+        model = st.selectbox("Model", OPENROUTER_MODELS, key="or_model")
+        c1, c2, c3 = st.columns(3)
+        temperature = c1.slider("Temperature", 0.0, 1.5, 0.7, 0.05, key="or_temp")
+        max_tokens = c2.slider("Max tokens", 64, 4096, 800, 64, key="or_tokens")
+        use_stream = c3.toggle("Stream reply", value=True, key="or_stream")
+        system_prompt = st.text_area(
+            "System prompt",
+            value=(
+                "You are a clear, friendly ML teaching assistant for first-year CSE students. "
+                "Use short paragraphs, concrete examples, and light analogies. "
+                "Prefer intuition before formulas."
+            ),
+            height=90,
+            key="or_sys",
+        )
 
-    example = "Explain logistic regression like I’m a first-year CSE student."
-    user_prompt = st.text_area("Ask an AI anything…", value=example, height=120, key="or_user")
+    st.markdown('<div class="section-label">Quick prompts</div>', unsafe_allow_html=True)
+    qcols = st.columns(len(QUICK_PROMPTS))
+    for i, (col, prompt) in enumerate(zip(qcols, QUICK_PROMPTS)):
+        label = prompt if len(prompt) < 42 else prompt[:39] + "…"
+        if col.button(label, key=f"qp_{i}", use_container_width=True):
+            st.session_state.or_pending_prompt = prompt
 
-    b1, b2 = st.columns(2)
-    send = b1.button("Send", type="primary", key="or_send")
-    explain_viz = b2.button("Explain this visualization", key="or_explain")
+    b1, b2, b3 = st.columns([1, 1, 1])
+    explain_viz = b1.button("Explain this visualization", key="or_explain", use_container_width=True)
+    clear_chat = b2.button("Clear chat", key="or_clear", use_container_width=True)
+    if b3.button("Jump from Logistic Regression context", key="or_from_lr", use_container_width=True):
+        ctx = st.session_state.get("openrouter_context") or ""
+        if ctx:
+            st.session_state.or_pending_prompt = (
+                f"Explain this live demo state to a student:\n\n{ctx}"
+            )
+        else:
+            st.session_state.or_pending_prompt = (
+                "Explain logistic regression decision boundaries and thresholds simply."
+            )
+
+    if clear_chat:
+        st.session_state.or_messages = []
+        st.rerun()
 
     if explain_viz:
         ctx = st.session_state.get("openrouter_context") or "the current ML playground demos"
-        user_prompt = (
+        st.session_state.or_pending_prompt = (
             f"Explain this visualization/demo context to a student in plain language:\n\n{ctx}"
         )
-        st.session_state.or_user = user_prompt
-        send = True
 
-    if send:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        with st.spinner("Calling OpenRouter…"):
-            ok, text = openrouter_chat(messages, model, temperature, max_tokens)
-        if ok:
-            st.markdown("#### Response")
-            st.markdown(text)
-        else:
-            st.error(text)
+    # Chat transcript
+    for msg in st.session_state.or_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pending = st.session_state.or_pending_prompt
+    user_text = st.chat_input("Ask an AI anything…")
+    if pending:
+        user_text = pending
+        st.session_state.or_pending_prompt = None
+
+    if user_text:
+        st.session_state.or_messages.append({"role": "user", "content": user_text})
+        with st.chat_message("user"):
+            st.markdown(user_text)
+
+        history = [{"role": "system", "content": system_prompt}] + list(st.session_state.or_messages)
+        # keep last N turns + system to stay laptop-friendly
+        if len(history) > 17:
+            history = [history[0]] + history[-16:]
+
+        with st.chat_message("assistant"):
+            if use_stream and key_present:
+                ok, result = openrouter_chat(
+                    history, model, temperature, max_tokens, stream=True
+                )
+                if not ok:
+                    st.error(result)
+                    st.session_state.or_messages.pop()  # drop failed user turn? keep it
+                else:
+                    try:
+                        answer = st.write_stream(_stream_openrouter(result))
+                    except Exception as e:
+                        st.error(f"Stream failed: {e}")
+                        answer = None
+                    if answer:
+                        st.session_state.or_messages.append(
+                            {"role": "assistant", "content": answer}
+                        )
+            else:
+                with st.spinner("Calling OpenRouter…"):
+                    ok, text = openrouter_chat(
+                        history, model, temperature, max_tokens, stream=False
+                    )
+                if ok:
+                    st.markdown(text)
+                    st.session_state.or_messages.append({"role": "assistant", "content": text})
+                else:
+                    st.error(text)
+
+    if not st.session_state.or_messages and not st.session_state.presentation_mode:
+        st.markdown(
+            """
+<div class="glass-card">
+  <h3>Try this live</h3>
+  <p>Pick a quick prompt above, or ask: <em>“Quiz me on confusion matrices.”</em>
+  Switch models mid-demo to show how gateways unlock many providers with one key.</p>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
 
 # ===========================================================================
@@ -1875,8 +2082,20 @@ def main() -> None:
             )
             st.session_state.page_idx = PAGES.index(choice)
             st.divider()
+            if get_openrouter_key():
+                st.markdown(
+                    '<div class="metric-chip tp">OpenRouter · ready</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="metric-chip fn">OpenRouter · no key</div>',
+                    unsafe_allow_html=True,
+                )
+            st.caption("Keys load from `.env` — never hardcode them.")
+            st.divider()
             st.markdown("**Shortcuts**")
-            st.caption("Use Previous / Next · **R** resets demo state via the Reset button.")
+            st.caption("Use Previous / Next · Reset clears demo state.")
             st.divider()
             st.markdown(
                 f'<div class="metric-chip">page {st.session_state.page_idx+1}/{len(PAGES)}</div>',
