@@ -1,0 +1,15 @@
+# Core — required to run: streamlit run ml_showcase.py
+streamlit==1.63.0
+numpy==2.5.2
+pandas==3.0.5
+matplotlib==3.11.1
+scikit-learn==1.9.0
+plotly==7.0.0
+requests==2.34.2
+Pillow==12.3.0
+
+# Optional — enable real YOLO / HF depth / plot click events
+# ultralytics
+# transformers
+# torch
+# streamlit-plotly-events
